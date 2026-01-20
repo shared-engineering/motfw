@@ -39,6 +39,7 @@
 #include "crc.h"
 #include "bms.h"
 #include "events.h"
+#include "timeout.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -46,6 +47,15 @@
 
 // Macros
 #define DIR_MULT		(motor_now()->m_conf.m_invert_direction ? -1.0 : 1.0)
+// timer period which is used to call the run_timer_tasks & limiter function
+#define MCIF_TIMER_PERIOD_MS (1)
+#define MCIF_TIMER_PERIOD_S ((float)MCIF_TIMER_PERIOD_MS / 1000)
+// lowpass filter constant used for calculating acceleration
+#define ACCEL_LOWPASS_CONSTANT (0.1)
+// acceleration calculation update period (seconds)
+#define ACCEL_UPDATE_PERIOD (0.02)
+// Fraction of max acceleration where current limiting starts
+#define ACCEL_LIMIT_START_FACTOR (0.5)
 
 // Global variables
 volatile uint16_t ADC_Value[HW_ADC_CHANNELS + HW_ADC_CHANNELS_EXTRA];
@@ -92,11 +102,14 @@ typedef struct {
 	uint64_t m_runtime_last;
 } motor_if_state_t;
 
+
+
 // Private variables
 static volatile motor_if_state_t m_motor_1;
 #ifdef HW_HAS_DUAL_MOTORS
 static volatile motor_if_state_t m_motor_2;
 #endif
+static volatile livectrl_values_t m_livectrl;
 
 // Sampling variables
 #define ADC_SAMPLE_MAX_LEN		2000
@@ -137,6 +150,7 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 static void run_timer_tasks(volatile motor_if_state_t *motor);
 static void update_stats(volatile motor_if_state_t *motor);
 static volatile motor_if_state_t *motor_now(void);
+static void mc_interface_livectrl_init(livectrl_values_t *livectrl);
 
 // Function pointers
 static void(*pwn_done_func)(void) = 0;
@@ -159,6 +173,9 @@ void mc_interface_init(void) {
 #ifdef HW_HAS_DUAL_MOTORS
 	memset((void*)&m_motor_2, 0, sizeof(motor_if_state_t));
 #endif
+	// initialize structure and cast to prevent volatile-cast-warning
+	// (volatile not relavant during init phase)
+	mc_interface_livectrl_init((livectrl_values_t *)&m_livectrl);
 
 	conf_general_read_mc_configuration((mc_configuration*)&m_motor_1.m_conf, false);
 #ifdef HW_HAS_DUAL_MOTORS
@@ -281,6 +298,29 @@ void mc_interface_select_motor_thread(int motor) {
 #else
 	(void)motor;
 #endif
+}
+
+/**
+ * Initialize livectrl struct
+ */
+void mc_interface_livectrl_init(livectrl_values_t *livectrl)
+{
+	memset((void*)livectrl, 0, sizeof(livectrl_values_t));
+	// init with math limits so by default they will have no effect at all 
+	livectrl->m_max_rpm = MCCONF_L_RPM_MAX;
+	livectrl->m_min_rpm = MCCONF_L_RPM_MIN;
+	livectrl->m_battery_cut_active = false;
+	livectrl->m_battery_cut_start = 0;
+	livectrl->m_battery_cut_end = 0;
+	livectrl->m_rpm_last = 0;
+	livectrl->m_accel_filtered_last = 0;
+	livectrl->m_max_accel = 0;
+	livectrl->m_min_accel = 0;
+	livectrl->m_time_last = chVTGetSystemTimeX();
+	livectrl->m_max_charge_current = 0;
+	livectrl->m_max_discharge_current = 0;
+	livectrl->m_max_charge_current_active = false;
+	livectrl->m_max_discharge_current_active = false;
 }
 
 /**
@@ -645,6 +685,397 @@ void mc_interface_set_pid_pos(float pos) {
 	}
 
 	events_add("set_pid_pos", pos);
+}
+
+/*
+* Set custom function to enable and disable all CAN communications
+* Base ID: 0x6E00 => ID4: 0x6E04; ID6: 0x6E06
+*/
+
+void mc_interface_livectrl_set_can_silence(uint8_t silence){
+	// How this works and the logic behind
+	// If silence: Always turn off all messages
+	// If not silence: Reload message settings from eeprom and apply them.
+	// Do NOT apply full config, as it might have changed in the meantime.
+
+	//get eeprom config
+	app_configuration *appconf_eeprom = mempools_alloc_appconf();
+	conf_general_read_app_configuration(appconf_eeprom);
+	//get actual app config
+	app_configuration *appconf = mempools_alloc_appconf();
+	*appconf = *app_get_configuration();
+
+	if (!!silence){
+		//if silence, we want to turn off all messages
+		appconf->can_status_msgs_r1 = 0b00000000;
+		appconf->can_status_msgs_r2 = 0b00000000;
+	}else{
+		//if not silence, we want to load the config from eeprom
+		appconf->can_status_msgs_r1 = appconf_eeprom->can_status_msgs_r1;
+		appconf->can_status_msgs_r2 = appconf_eeprom->can_status_msgs_r2;
+	}
+
+	app_set_configuration(appconf);
+
+	mempools_free_appconf(appconf);
+	mempools_free_appconf(appconf_eeprom);
+	events_add("change can silence settings to:", !!silence);
+}
+/**
+ * Get livectrl values for can status, etc.
+ */
+
+bool mc_interface_livectrl_get_gearchange_active(void){
+	return m_livectrl.gearchange_active;
+}
+	
+bool mc_interface_livectrl_get_gearchange_successful(void) {
+	return m_livectrl.gearchange_successful;
+}
+int mc_interface_livectrl_get_gearchange_time(void) {
+	return m_livectrl.gearchange_time;
+}
+
+uint8_t mc_interface_livectrl_get_gearchange_counter(void) {
+	return m_livectrl.gearchange_counter;
+}
+
+/**
+ * Set custom function to activate gear change mechanism via can. Includes gear wiggle, etc.
+ */
+
+void mc_interface_livectrl_set_gearchange_func(float openloop_current, float openloop_erpm, float openloop_time, int destination_gear, float first_threshold, float second_threshold){
+	//we run this in a loop for two seconds
+	//we change the ID on the fly to 20 and then back to the id before
+	timeout_configure(openloop_time, 0.0, KILL_SW_MODE_DISABLED);
+	systime_t timestamp_foc_openloop_start = chVTGetSystemTimeX();
+	systime_t timestamp_gear_disengagement = 0;
+
+	if (fabsf(openloop_current) > 15 || fabsf(openloop_erpm) > 1000 || openloop_time > 4000) {
+		commands_printf("Invalid openloop parameters, current: %.1f, erpm: %.1f, time: %.1f ms", (double)openloop_current, (double)openloop_erpm, (double)openloop_time);
+		return;
+	}
+	
+	//suppress compiler warnings for unused vars
+	float testval = destination_gear;
+	testval = first_threshold;
+	testval = second_threshold;
+	testval = 0;
+
+	//save old app configuration
+	//and set the new one with new app id
+	int old_app_id = app_get_configuration()->controller_id;
+	int old_timeout = app_get_configuration()->timeout_msec;
+	app_configuration *new_app_conf = mempools_alloc_appconf();
+	new_app_conf->controller_id = 20; // MOV specific ID for openloop
+	app_set_configuration(new_app_conf);
+	mempools_free_appconf(new_app_conf);
+	events_add("livectrl_openloop_timeout_conf", openloop_time);
+
+	m_livectrl.gearchange_successful = false;
+	m_livectrl.gearchange_time = 0;
+	m_livectrl.gearchange_active = true;
+
+	//reset timeout and start openloop
+	timeout_reset();
+	mc_interface_set_openloop_current(openloop_current, openloop_erpm);
+	int fault = mc_interface_get_fault();
+	if (fault != FAULT_CODE_NONE) {
+		commands_printf("Fault occured during openloop: %s", mc_interface_fault_to_string(fault));
+		commands_printf("For more info type \"faults\" to view all logged faults\n");
+	}
+
+	//wait for openloop to finish and monitor RPMs closely:
+	//This is a mini state machine, that will control when to stop wiggling
+	// State machine works as follows:
+	// 1. wiggle until we reach 70% of set openloop_erpm
+	// 2. If the speed drops below 60% of set openloop_erpm, we stop
+	// 3. If the speed stays above 60% of openloop_erpm, we stop after timeout and report unsuccessfull.
+	bool leave_starting_gear_success = false;
+	bool engage_final_gear_success = false;
+	bool gear_change_success = false;
+
+	int number_of_checks = 0;
+
+	float motor_speed_during_gear_change = mc_interface_get_rpm();
+	while (UTILS_AGE_S(timestamp_foc_openloop_start) < (openloop_time / 1000.0)) {
+		motor_speed_during_gear_change = mcpwm_foc_get_rpm_faster();
+		number_of_checks++;
+		//commands_printf("Current speed: %f, number of checks: %d\n", (double)motor_speed_during_gear_change, number_of_checks);
+		if (motor_speed_during_gear_change >= (fabsf(openloop_erpm) * 0.75) && !leave_starting_gear_success) {
+			//we are above 70% of openloop_erpm, so we can leave the starting gear
+			leave_starting_gear_success = true;
+			commands_printf("detected disengagement from start gear, time: %d ms\n", (int)(UTILS_AGE_S(timestamp_foc_openloop_start) * 1000));
+			timestamp_gear_disengagement = chVTGetSystemTimeX();
+		}
+		if (motor_speed_during_gear_change < (fabsf(openloop_erpm) * 0.6) && leave_starting_gear_success && chVTGetSystemTimeX() > timestamp_gear_disengagement + MS2ST(150)) {
+			//we are below 60% of openloop_erpm, so we stop
+			engage_final_gear_success = true;
+			commands_printf("detected engagement to final gear, time: %d ms\n", (int)(UTILS_AGE_S(timestamp_foc_openloop_start) * 1000));
+		}
+		if (leave_starting_gear_success && engage_final_gear_success) {
+			//we are done, we successfully changed the gear
+			gear_change_success = true;
+			break;
+		}
+		chThdSleepMilliseconds(30);
+	}
+
+	//restore old app configuration
+	new_app_conf = mempools_alloc_appconf();
+	new_app_conf->controller_id = old_app_id;
+	app_set_configuration(new_app_conf);
+	mempools_free_appconf(new_app_conf);
+	
+
+	//restore timeout
+	timeout_configure(old_timeout, 0.0, KILL_SW_MODE_DISABLED);
+	events_add("livectrl_openloop_timeout_restore", old_timeout);
+	//Good to go now
+}
+
+/**
+ * Set custom function to activate CAN openloop via CAN
+ */
+
+void mc_interface_livectrl_set_openloop_func(float openloop_current, float openloop_erpm, float openloop_time){
+	//we run this in a loop for two seconds
+	//we change the ID on the fly to 20 and then back to the id before
+	timeout_configure(openloop_time, 0.0, KILL_SW_MODE_DISABLED);
+	systime_t timestamp_foc_openloop_start = chVTGetSystemTimeX();
+	systime_t timestamp_gear_disengagement = 0;
+
+	if (fabsf(openloop_current) > 15 || fabsf(openloop_erpm) > 1000 || openloop_time > 4000) {
+		commands_printf("Invalid openloop parameters, current: %.1f, erpm: %.1f, time: %.1f ms", (double)openloop_current, (double)openloop_erpm, (double)openloop_time);
+		events_add("livectrl_openloop_invalid_params", 0);
+		return;
+	}
+
+	//save old app configuration
+	//and set the new one with new app id
+	int old_app_id = app_get_configuration()->controller_id;
+	int old_timeout = app_get_configuration()->timeout_msec;
+	app_configuration *new_app_conf = mempools_alloc_appconf();
+	new_app_conf->controller_id = 20; // MOV specific ID for openloop
+	app_set_configuration(new_app_conf);
+	mempools_free_appconf(new_app_conf);
+	events_add("livectrl_openloop_timeout_conf", openloop_time);
+	commands_printf("Start openloop, current: %.1f, erpm: %.1f, time: %.1f ms", (double)openloop_current, (double)openloop_erpm, (double)openloop_time);
+
+	//reset timeout and start openloop
+	timeout_reset();
+	mc_interface_set_openloop_current(openloop_current, openloop_erpm);
+	int fault = mc_interface_get_fault();
+	if (fault != FAULT_CODE_NONE) {
+		commands_printf("Fault occured during openloop: %s", mc_interface_fault_to_string(fault));
+	}
+
+	while(UTILS_AGE_S(timestamp_foc_openloop_start) < (openloop_time / 1000.0)) {
+		//wait for openloop timeout
+		chThdSleepMilliseconds(10);
+	}
+
+	//restore old app configuration
+	new_app_conf = mempools_alloc_appconf();
+	new_app_conf->controller_id = old_app_id;
+	app_set_configuration(new_app_conf);
+	mempools_free_appconf(new_app_conf);
+	
+	//restore timeout
+	timeout_configure(old_timeout, 0.0, KILL_SW_MODE_DISABLED);
+	events_add("livectrl_openloop_timeout_restore", old_timeout);
+	//Good to go now
+}
+
+/**
+ * Set custom DC (Battery) current limit for discharge current.
+ * This is current delivered by the battery to the system under acceleration
+ * Message ID is 0x6Bnn where nn is MCU ID
+ * Only positive values are allowed.
+ */
+
+void mc_interface_livectrl_set_max_batterydischarge(float maxDischargeCurrent){
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	// Check for 60A abs max current due to wiring limitations
+	if (abs(maxDischargeCurrent) > 60) {
+		events_add("livectrl_discharge_current_out_of_range", maxDischargeCurrent);
+		return;
+	}
+	
+	//if negative Values are entered, we do not want to apply them!
+	//Discharge Current ist always positive.
+	if (maxDischargeCurrent < 0){
+		events_add("livectrl_discharge_current_out_of_range", maxDischargeCurrent);
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+		case MOTOR_TYPE_BLDC:
+		case MOTOR_TYPE_DC:
+		case MOTOR_TYPE_FOC:
+			m_livectrl.m_max_discharge_current = maxDischargeCurrent;
+			m_livectrl.m_max_discharge_current_active = true;
+			break;
+		default:
+			break;
+	}
+
+	events_add("set_livectrl_max_discharge_current", maxDischargeCurrent);
+}
+
+/**
+ * Set custom DC (Battery) current limit for charge current
+ * This is current from the system into the battery during braking for exanmple.
+ * Message ID is 0x6Cnn where nn is MCU ID
+ * Only negative values are allowed.
+ */
+void mc_interface_livectrl_set_max_batterycharge(float maxChargeCurrent){
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	// Check for 60A abs max current due to wiring limitations
+	if (abs(maxChargeCurrent) > 60) {
+		events_add("livectrl_charge_current_out_of_range", maxChargeCurrent);
+		return;
+	}
+
+	//if positive values are entered, we do not want to apply them!
+	//According to mcu tool definition, charge (regen) current is always negative and is also sent as negative.
+	if (maxChargeCurrent > 0){
+		events_add("livectrl_charge_current_out_of_range", maxChargeCurrent);
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+		case MOTOR_TYPE_BLDC:
+		case MOTOR_TYPE_DC:
+		case MOTOR_TYPE_FOC:
+			m_livectrl.m_max_charge_current = maxChargeCurrent;
+			m_livectrl.m_max_charge_current_active = true;
+			break;
+		default:
+			break;
+	}
+
+	events_add("set_livectrl_max_charge_current", maxChargeCurrent);
+}
+
+
+/**
+ * Set custom positive maxrpm limit
+ */
+void mc_interface_livectrl_set_max_rpm(float maxrpm) {
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+	case MOTOR_TYPE_BLDC:
+	case MOTOR_TYPE_DC:
+	case MOTOR_TYPE_FOC:
+		m_livectrl.m_max_rpm = maxrpm;
+		break;
+
+	default:
+		break;
+	}
+
+	events_add("set_livectrl_max_rpm", maxrpm);
+}
+
+/**
+ * Set custom negative maxrpm limit
+ */
+void mc_interface_livectrl_set_min_rpm(float minrpm) {
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+	case MOTOR_TYPE_BLDC:
+	case MOTOR_TYPE_DC:
+	case MOTOR_TYPE_FOC:
+		m_livectrl.m_min_rpm = minrpm;
+		break;
+
+	default:
+		break;
+	}
+
+	events_add("set_livectrl_min_rpm", minrpm);
+}
+
+/**
+ * Set custom positive acceleration limit in rpm/s^2
+ */
+void mc_interface_livectrl_set_max_accel(float maxaccel) {
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+	case MOTOR_TYPE_BLDC:
+	case MOTOR_TYPE_DC:
+	case MOTOR_TYPE_FOC:
+		m_livectrl.m_max_accel = maxaccel;
+		break;
+
+	default:
+		break;
+	}
+
+	events_add("set_livectrl_max_accel", maxaccel);
+}
+
+/**
+ * Set custom negative acceleration (deceleration) limit in rpm/s^2
+ */
+void mc_interface_livectrl_set_min_accel(float minaccel) {
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+	case MOTOR_TYPE_BLDC:
+	case MOTOR_TYPE_DC:
+	case MOTOR_TYPE_FOC:
+		m_livectrl.m_min_accel = minaccel;
+		break;
+
+	default:
+		break;
+	}
+
+	events_add("set_livectrl_min_accel", minaccel);
+}
+
+/**
+ * Set custom battery cutoff values
+ */
+void mc_interface_livectrl_set_battery_cutoff(float startvolt, float endvolt) {
+	if (mc_interface_try_input()) {
+		return;
+	}
+
+	switch (motor_now()->m_conf.motor_type) {
+	case MOTOR_TYPE_BLDC:
+	case MOTOR_TYPE_DC:
+	case MOTOR_TYPE_FOC:
+		m_livectrl.m_battery_cut_start = startvolt;
+		m_livectrl.m_battery_cut_end = endvolt;
+		m_livectrl.m_battery_cut_active = true;
+		break;
+
+	default:
+		break;
+	}
+
+	events_add("set_livectrl_battery_cutoff_start", startvolt);
+	events_add("set_livectrl_battery_cutoff_end", endvolt);
 }
 
 void mc_interface_set_current(float current) {
@@ -1045,6 +1476,23 @@ float mc_interface_get_rpm(void) {
 	}
 
 	return DIR_MULT * ret;
+}
+
+float mc_interface_get_accel_filtered(void) {
+	float ret = 0.0;
+
+	switch (motor_now()->m_conf.motor_type) {
+	case MOTOR_TYPE_BLDC:
+	case MOTOR_TYPE_DC:
+	case MOTOR_TYPE_FOC:
+		ret = m_livectrl.m_accel_filtered_last;
+		break;
+
+	default:
+		break;
+	}
+
+	return ret;
 }
 
 /**
@@ -2305,17 +2753,24 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 	float lo_max_mot = l_current_max_tmp;
 	if (motor->m_temp_motor < (conf->l_temp_motor_start + 0.1)) {
 		// Keep values
+		//add an event to the event queue
+		//events_add("Motor cool enough, no derating", lo_max_mot);
 	} else if (motor->m_temp_motor > (conf->l_temp_motor_end - 0.1)) {
 		lo_min_mot = 0.0;
 		lo_max_mot = 0.0;
+		//add an event to the event queue
+		//events_add("Motor Overtemp detected", motor->m_temp_motor);
 		mc_interface_fault_stop(FAULT_CODE_OVER_TEMP_MOTOR, !is_motor_1, false);
 	} else {
+
 		float maxc = fabsf(l_current_max_tmp);
 		if (fabsf(l_current_min_tmp) > maxc) {
 			maxc = fabsf(l_current_min_tmp);
 		}
 
 		maxc = utils_map(motor->m_temp_motor, conf->l_temp_motor_start, conf->l_temp_motor_end, maxc, 0.0);
+		//add an event to the event queue
+		//events_add("Motor warm and derating, max current:", maxc);
 
 		if (fabsf(l_current_min_tmp) > maxc) {
 			lo_min_mot = SIGN(l_current_min_tmp) * maxc;
@@ -2355,8 +2810,12 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 
 	// RPM max
 	float lo_max_rpm = 0.0;
-	const float rpm_pos_cut_start = conf->l_max_erpm * conf->l_erpm_start;
-	const float rpm_pos_cut_end = conf->l_max_erpm;
+	float max_erpm = conf->l_max_erpm;
+	// is livectrl max value smaller than configuration value -> use livectrl value
+	if (m_livectrl.m_max_rpm < max_erpm)
+		max_erpm = m_livectrl.m_max_rpm;
+	const float rpm_pos_cut_start = max_erpm * conf->l_erpm_start;
+	const float rpm_pos_cut_end = max_erpm;
 	if (rpm_now < (rpm_pos_cut_start + 0.1)) {
 		lo_max_rpm = l_current_max_tmp;
 	} else if (rpm_now > (rpm_pos_cut_end - 0.1)) {
@@ -2367,14 +2826,77 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 
 	// RPM min
 	float lo_min_rpm = 0.0;
-	const float rpm_neg_cut_start = conf->l_min_erpm * conf->l_erpm_start;
-	const float rpm_neg_cut_end = conf->l_min_erpm;
+	float min_erpm = conf->l_min_erpm;
+	// is livectrl min value bigger than configuration value -> use livectrl value
+	if (m_livectrl.m_min_rpm > min_erpm)
+		min_erpm = m_livectrl.m_min_rpm;
+	const float rpm_neg_cut_start = min_erpm * conf->l_erpm_start;
+	const float rpm_neg_cut_end = min_erpm;
 	if (rpm_now > (rpm_neg_cut_start - 0.1)) {
 		lo_min_rpm = l_current_max_tmp;
 	} else if (rpm_now < (rpm_neg_cut_end + 0.1)) {
 		lo_min_rpm = 0.0;
 	} else {
 		lo_min_rpm = utils_map(rpm_now, rpm_neg_cut_start, rpm_neg_cut_end, l_current_max_tmp, 0.0);
+	}
+
+	// use last acceleration value (in case we dont update it in this pass)
+	float accel_filtered = m_livectrl.m_accel_filtered_last;
+	// get current system time (ticks)
+	systime_t timenow = chVTGetSystemTimeX();
+	// calculate time difference in seconds since last acceleration check
+	float timediff = (float)(timenow - m_livectrl.m_time_last) / CH_CFG_ST_FREQUENCY;
+	// updates should be slow - only update after some time
+	if (timediff >= ACCEL_UPDATE_PERIOD)
+	{
+		// slower value is good enought and might reduce need for quality filtering
+		float rpm_slow = mc_interface_get_rpm();
+		// calculate acceleration in rpm/s^2 using change of rpm and timer period
+		float accel = (rpm_slow - m_livectrl.m_rpm_last) / timediff;
+		// calculate low pass filter where ACCELERATION_LOWPASS_CONSTANT is the RC constant
+		accel_filtered = accel * ACCEL_LOWPASS_CONSTANT + 
+						 m_livectrl.m_accel_filtered_last * (1.0 - ACCEL_LOWPASS_CONSTANT);
+		// save filtered acceleration value for next pass
+		m_livectrl.m_accel_filtered_last = accel_filtered;
+		// save rpm value for next pass
+		m_livectrl.m_rpm_last = rpm_slow;
+		// save this time for next pass
+		m_livectrl.m_time_last = timenow;
+	}
+
+	// init current limits for acceleration limiters
+	float lo_max_accel = l_current_max_tmp;
+	// limit max acceleration only if limit was set
+	if (m_livectrl.m_max_accel != 0) {
+		// calculate limiting start value
+		float accel_max_start = m_livectrl.m_max_accel * ACCEL_LIMIT_START_FACTOR;
+
+		// acceleration in safe range?
+		if (accel_filtered <= accel_max_start) {
+			// keep lo_max_accel init value
+		} else if (accel_filtered > m_livectrl.m_max_accel) { // acceleration clearly too much?
+			lo_max_accel = 0.0;
+		} else {
+			// acceleration within start-end range
+			lo_max_accel = utils_map(accel_filtered, accel_max_start, m_livectrl.m_max_accel, l_current_max_tmp, 0.0);
+		}
+	}
+	// init current limit for min acceleration(here deceleration) limiter
+	// using min current (braking current value)
+	float lo_min_accel = l_current_min_tmp;
+	// limit min acceleration only if limit was set
+	if (m_livectrl.m_min_accel != 0) {
+		// calculate limiting start value
+		float accel_min_start = m_livectrl.m_min_accel * ACCEL_LIMIT_START_FACTOR;
+
+		// acceleration(deceleration!) in safe range?
+		if (accel_filtered >= accel_min_start) {
+			// keep lo_min_accel init value
+		} else if (accel_filtered < m_livectrl.m_min_accel) { // deceleration clearly too much?
+			lo_min_accel = 0.0;
+		} else {
+			lo_min_accel = utils_map(accel_filtered, accel_min_start, m_livectrl.m_min_accel, l_current_min_tmp, 0.0);
+		}
 	}
 
 	// Start Current Decrease
@@ -2393,9 +2915,11 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 				conf->l_max_duty, l_current_max_tmp, conf->cc_min_current * 5.0);
 	}
 
-	float lo_max = utils_min_abs(lo_max_mos, lo_max_mot);
 	float lo_min = utils_min_abs(lo_min_mos, lo_min_mot);
+	lo_min = utils_min_abs(lo_min, lo_min_accel);
 
+	float lo_max = utils_min_abs(lo_max_mos, lo_max_mot);
+	lo_max = utils_min_abs(lo_max, lo_max_accel);
 	lo_max = utils_min_abs(lo_max, lo_max_rpm);
 	lo_max = utils_min_abs(lo_max, lo_min_rpm);
 	lo_max = utils_min_abs(lo_max, lo_max_curr_dec);
@@ -2414,15 +2938,25 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 	conf->lo_current_max = lo_max;
 	conf->lo_current_min = lo_min;
 
+	// use config values by default
+	float bat_cut_start = conf->l_battery_cut_start;
+	float bat_cut_end = conf->l_battery_cut_end;
+	if (m_livectrl.m_battery_cut_active)
+	{
+		// locally overwrite values when override was requested
+		bat_cut_start = m_livectrl.m_battery_cut_start;
+		bat_cut_end = m_livectrl.m_battery_cut_end;
+	}
+
 	// Battery cutoff
 	float lo_in_max_batt = 0.0;
-	if (v_in > (conf->l_battery_cut_start - 0.1)) {
+	if (v_in > (bat_cut_start - 0.1)) {
 		lo_in_max_batt = conf->l_in_current_max;
-	} else if (v_in < (conf->l_battery_cut_end + 0.1)) {
+	} else if (v_in < (bat_cut_end + 0.1)) {
 		lo_in_max_batt = 0.0;
 	} else {
-		lo_in_max_batt = utils_map(v_in, conf->l_battery_cut_start,
-				conf->l_battery_cut_end, conf->l_in_current_max, 0.0);
+		lo_in_max_batt = utils_map(v_in, bat_cut_start,
+				bat_cut_end, conf->l_in_current_max, 0.0);
 	}
 
 	// Wattage limits
@@ -2431,6 +2965,17 @@ static void update_override_limits(volatile motor_if_state_t *motor, volatile mc
 
 	float lo_in_max = utils_min_abs(lo_in_max_watt, lo_in_max_batt);
 	float lo_in_min = lo_in_min_watt;
+
+	// Livecontrol Battery current limits for charge and recharge
+	// If these new values are lower than the input currents from wattage limits, we constrain accordingly
+	// Due to the structure of the bms_update_limits, the livectrl values can only be LOWER than the config in the VESC.
+	// This actually makes sense: The VESC standard config will contain values that are safe for components (cables!) and can then be reduced for smaller battery packs, etc.
+	if (m_livectrl.m_max_discharge_current_active){
+		lo_in_max = utils_min_abs(m_livectrl.m_max_discharge_current, lo_in_max);
+	}
+	if (m_livectrl.m_max_charge_current_active){
+		lo_in_min = utils_min_abs(m_livectrl.m_max_charge_current, lo_in_min);
+	}
 
 	// BMS limits
 	bms_update_limits(&lo_in_min,  &lo_in_max, conf->l_in_current_min, conf->l_in_current_max);
@@ -2656,7 +3201,7 @@ static THD_FUNCTION(timer_thread, arg) {
 		run_timer_tasks(&m_motor_2);
 #endif
 
-		chThdSleepMilliseconds(1);
+		chThdSleepMilliseconds(MCIF_TIMER_PERIOD_MS);
 	}
 }
 

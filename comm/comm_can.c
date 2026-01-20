@@ -41,6 +41,7 @@
 #include "encoder_cfg.h"
 #include "servo_dec.h"
 #include "utils.h"
+#include "events.h"
 #ifdef USE_LISPBM
 #include "lispif.h"
 #endif
@@ -1205,10 +1206,20 @@ void comm_can_send_status5(uint8_t id, bool replace) {
 void comm_can_send_status6(uint8_t id, bool replace) {
 	int32_t send_index = 0;
 	uint8_t buffer[8];
-	buffer_append_float16(buffer, ADC_VOLTS(ADC_IND_EXT), 1e3, &send_index);
-	buffer_append_float16(buffer, ADC_VOLTS(ADC_IND_EXT2), 1e3, &send_index);
-	buffer_append_float16(buffer, ADC_VOLTS(ADC_IND_EXT3), 1e3, &send_index);
-	buffer_append_float16(buffer, servodec_get_servo(0), 1e3, &send_index);
+
+	bool success = mc_interface_livectrl_get_gearchange_successful();
+	int gearchangetime = mc_interface_livectrl_get_gearchange_time();
+	int gearchangecounter = mc_interface_livectrl_get_gearchange_counter();
+	bool active = mc_interface_livectrl_get_gearchange_active();
+	
+	//send gearshift info
+	//first byte contains bools:
+	buffer[send_index++] = (success ? 1 : 0) | ((active ? 1 : 0) << 1);
+	//second and third byte contains the time in ms
+	buffer_append_int16(buffer, gearchangetime, &send_index);
+	//fourth byte contains the gearchange counter
+	buffer[send_index++] = gearchangecounter;
+
 	comm_can_transmit_eid_replace(id | ((uint32_t)CAN_PACKET_STATUS_6 << 8),
 			buffer, send_index, replace, 0);
 }
@@ -1524,6 +1535,111 @@ static void decode_msg(uint32_t eid, uint8_t *data8, int len, bool is_replaced) 
 
 	if (id == 255 || id == id1 || id == id2) {
 		switch (cmd) {
+		case CAN_PACKET_GET_VERSION: {
+			uint8_t buffer[3];
+			buffer[0] = FW_VERSION_MINOR;
+			buffer[1] = FW_VERSION_MAJOR;
+			buffer[2] = FW_VERSION_USER;
+			float temp_version = FW_VERSION_MAJOR*100 + FW_VERSION_MINOR + (float)FW_VERSION_USER/100;
+			events_add("FW VERSION:", temp_version);
+			comm_can_transmit_eid_replace(app_get_configuration()->controller_id |
+					((uint32_t)CAN_PACKET_GET_VERSION << 8), buffer, 3, true, 0);
+		} break;
+
+		case CAN_PACKET_SET_CAN_SILENCE: {
+			//Base ID: 0x6E00 => ID4: 0x6E04; ID6: 0x6E06
+			// Silence Payload: "Shut Up!"
+			// 0x53 68 75 74 20 55 70 21
+			// 0x53 = S, 0x68 = h, 0x75 = u, 0x74 = t, 0x20 = space, 0x55 = U, 0x70 = p, 0x21 = !
+			if (len >= 8 && data8[0] == 'S' && data8[1] == 'h' && data8[2] == 'u' &&
+					data8[3] == 't' && data8[4] == ' ' && data8[5] == 'U' &&
+					data8[6] == 'p' && data8[7] == '!') {
+				mc_interface_livectrl_set_can_silence(true);
+			}
+
+			// Payload to turn on CAN comms: "Go Ahead"
+			// 0x47 6F 20 41 68 65 61 64
+			else if (len >= 8 && data8[0] == 'G' && data8[1] == 'o' && data8[2] == ' ' &&
+					data8[3] == 'A' && data8[4] == 'h' && data8[5] == 'e' &&
+					data8[6] == 'a' && data8[7] == 'd') {
+				mc_interface_livectrl_set_can_silence(false);
+			} else {
+				// If the payload is not recognized, we just ignore it but add an entry to the events log.
+				events_add("CAN SILENCE: Unrecognized payload", 0);
+			}
+		} break;
+		
+		case CAN_PACKET_SET_FOC_OPENLOOP:{
+			//Base ID is 0d109 (0x6D00 in hex)
+			//So for example for ID4, we send to id: 0x6D04, for ID 6 we send to 0x6D06, etc
+			//Payload: DLC = 6 bytes, [0] = current_high, [1] = current_low, [2] = erpm_high, [3] = erpm_low, [4] = timeout_high, [5] = timeout_low
+			ind = 0;
+			int16_t current_foc_openloop = buffer_get_int16(data8, &ind); //current in A
+			int16_t erpm_foc_openloop = buffer_get_int16(data8, &ind); //erpm in erpm
+			int16_t timeout_foc_openloop = buffer_get_int16(data8, &ind); //time to run the openloop for in ms
+
+			mc_interface_livectrl_set_openloop_func(current_foc_openloop, erpm_foc_openloop, timeout_foc_openloop);
+		}break;
+
+		case CAN_PACKET_SET_GEAR_CHANGE_MODE:{
+			//Base ID is 0d111 (0x6F00 in hex)
+			//So for example for ID4, we send to id: 0x6F04, for ID 6 we send to 0x6F06, etc
+			//Payload: DLC = 6 bytes, [0] = current_high, [1] = current_low, [2] = erpm_high, [3] = erpm_low, [4] = timeout_high, [5] = timeout_low
+			ind = 0;
+			int16_t current_foc_openloop = buffer_get_int16(data8, &ind); //current in A
+			int16_t erpm_foc_openloop = buffer_get_int16(data8, &ind); //erpm in erpm
+			int16_t timeout_foc_openloop = buffer_get_int16(data8, &ind); //time to run the openloop for in ms
+			uint8_t destination_gear = 0;
+			float first_threshold = 0.0f;
+			float second_threshold = 0.0f;
+
+			mc_interface_livectrl_set_gearchange_func(current_foc_openloop, erpm_foc_openloop, timeout_foc_openloop, destination_gear, first_threshold, second_threshold);
+		}break;
+
+		case CAN_PACKET_SET_BATTERY_CURRENT_MAXDISCHARGE: //107u in decimal equals 6b
+			ind = 0;
+			mc_interface_livectrl_set_max_batterydischarge(buffer_get_float32(data8, 1e0, &ind));
+			timeout_reset();
+			break;
+
+		case CAN_PACKET_SET_BATTERY_CURRENT_MAXCHARGE: //108u in decimal equals 6c
+			ind = 0;
+			mc_interface_livectrl_set_max_batterycharge(buffer_get_float32(data8, 1e0, &ind));
+			timeout_reset();
+			break;
+
+		case CAN_PACKET_SET_MAX_RPM:
+			ind = 0;
+			mc_interface_livectrl_set_max_rpm(buffer_get_float32(data8, 1e0, &ind));
+			timeout_reset();
+			break;
+
+		case CAN_PACKET_SET_MIN_RPM:
+			ind = 0;
+			mc_interface_livectrl_set_min_rpm(buffer_get_float32(data8, 1e0, &ind));
+			timeout_reset();
+			break;
+		
+		case CAN_PACKET_SET_MAX_ACCEL:
+			ind = 0;
+			mc_interface_livectrl_set_max_accel(buffer_get_float32(data8, 1e0, &ind));
+			timeout_reset();
+			break;
+
+		case CAN_PACKET_SET_MIN_ACCEL:
+			ind = 0;
+			mc_interface_livectrl_set_min_accel(buffer_get_float32(data8, 1e0, &ind));
+			timeout_reset();
+			break;
+				
+		case CAN_PACKET_SET_BATTERY_CUT: {
+			ind = 0;
+			float start = buffer_get_float32(data8, 1e3, &ind);
+			float end = buffer_get_float32(data8, 1e3, &ind);
+			mc_interface_livectrl_set_battery_cutoff(start, end);
+			timeout_reset();
+		} break;
+
 		case CAN_PACKET_SET_DUTY:
 			ind = 0;
 			mc_interface_set_duty(buffer_get_float32(data8, 1e5, &ind));
@@ -1532,10 +1648,6 @@ static void decode_msg(uint32_t eid, uint8_t *data8, int len, bool is_replaced) 
 
 		case CAN_PACKET_SET_CURRENT:
 			ind = 0;
-			if (len >= 6) {
-				mc_interface_set_current_off_delay(buffer_get_float16(data8, 1e3, &ind));
-			}
-
 			mc_interface_set_current(buffer_get_float32(data8, 1e3, &ind));
 
 			timeout_reset();
@@ -1725,6 +1837,33 @@ static void decode_msg(uint32_t eid, uint8_t *data8, int len, bool is_replaced) 
 			mc_interface_set_handbrake_rel(buffer_get_float32(data8, 1e5, &ind));
 			timeout_reset();
 			break;
+
+		case CAN_PACKET_SET_CURRENT_HANDBRAKE_REL_MAXRPM: {
+				ind = 0;
+				float rpmmax = buffer_get_float32(data8, 1e0, &ind);
+				float rpmnow = mc_interface_get_rpm();
+				uint8_t buffer[5];
+				// speed within given max limit?
+				if (fabsf(rpmnow) <= fabsf(rpmmax))
+				{
+					// relative 
+					float relative = buffer_get_float32(data8, 1e5, &ind);
+					mc_interface_set_handbrake_rel(relative);
+					// success feedback
+					buffer[0] = 1;
+				} else {
+					// failed feedback
+					buffer[0] = 0;
+				}
+				int32_t send_index = 1;
+				// append current rpm
+				buffer_append_int32(buffer, (int32_t)rpmnow, &send_index);
+				comm_can_transmit_eid_replace(app_get_configuration()->controller_id | 
+								((uint32_t)CAN_PACKET_SET_CURRENT_HANDBRAKE_REL_MAXRPM << 8),
+								buffer, 5, true, 0);
+
+				timeout_reset();
+			} break;
 
 		case CAN_PACKET_PING: {
 			uint8_t buffer[2];

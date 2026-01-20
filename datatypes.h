@@ -1216,6 +1216,19 @@ typedef enum {
 	CAN_PACKET_GNSS_LAT,
 	CAN_PACKET_GNSS_LON,
 	CAN_PACKET_GNSS_ALT_SPEED_HDOP,
+	
+	CAN_PACKET_SET_MIN_RPM = 100,
+	CAN_PACKET_SET_MAX_RPM,
+	CAN_PACKET_SET_MIN_ACCEL,
+	CAN_PACKET_SET_MAX_ACCEL,
+	CAN_PACKET_SET_BATTERY_CUT,
+	CAN_PACKET_GET_VERSION,
+	CAN_PACKET_SET_CURRENT_HANDBRAKE_REL_MAXRPM,
+	CAN_PACKET_SET_BATTERY_CURRENT_MAXDISCHARGE,
+	CAN_PACKET_SET_BATTERY_CURRENT_MAXCHARGE,
+	CAN_PACKET_SET_FOC_OPENLOOP,
+	CAN_PACKET_SET_CAN_SILENCE,
+	CAN_PACKET_SET_GEAR_CHANGE_MODE,
 	CAN_PACKET_MAKE_ENUM_32_BITS = 0xFFFFFFFF,
 } CAN_PACKET_ID;
 
@@ -1313,6 +1326,27 @@ typedef struct {
 	float adc_3;
 	float ppm;
 } can_status_msg_6;
+
+typedef struct {
+	float m_max_rpm;
+	float m_min_rpm;
+	bool m_battery_cut_active;
+	float m_battery_cut_start;
+	float m_battery_cut_end;
+	float m_rpm_last;
+	float m_accel_filtered_last;
+	float m_max_accel;
+	float m_min_accel;
+	float m_max_charge_current;
+	float m_max_discharge_current;
+	bool m_max_charge_current_active;
+	bool m_max_discharge_current_active;
+	bool gearchange_successful;
+	int gearchange_time;
+	uint8_t gearchange_counter;
+	bool gearchange_active;
+	systime_t m_time_last;
+} livectrl_values_t;
 
 typedef struct {
 	int id;
